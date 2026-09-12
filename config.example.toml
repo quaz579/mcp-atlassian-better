@@ -1,0 +1,95 @@
+# mcp-atlassian-better example configuration.
+#
+# Default location: ${XDG_CONFIG_HOME:-~/.config}/mcp-atlassian-better/config.toml
+# Override with the MCP_ATLASSIAN_BETTER_CONFIG environment variable, or --config PATH.
+# Recommended permissions: chmod 600 (a world/group-readable file still loads,
+# but mcp-atlassian-better logs a warning).
+
+[defaults]
+# Used by every site that doesn't set its own username/token.
+username       = "you@example.com"
+# Prefer an environment variable over a literal token in this file:
+api_token_env  = "JIRA_API_TOKEN"
+# A literal token also works ("api_token = \"...\""), but mcp-atlassian-better logs
+# an INFO line each time suggesting api_token_env instead. Never set both.
+
+# "curated" (37 hand-picked tools: issues, search, comments, transitions,
+# users, links, worklog, project basics) or "all" (every jira_-prefixed tool
+# upstream exposes).
+toolset_preset = "curated"
+
+call_timeout_seconds    = 120
+connect_timeout_seconds = 90
+# Per-file cap enforced by jira_download_attachments (checked against both
+# the server's reported Content-Length and the actual streamed byte count).
+# 100 MiB default.
+attachment_max_bytes    = 104857600
+# How long (seconds) a failed site stays marked "failed" before the next
+# call that needs it -- or jira_sites -- tries to reconnect it. Default 30.
+# recovery_cooldown_seconds = 30
+# Upper bound (seconds) on how long one jira_sites call waits for recovery
+# to settle before returning; a slower recovery keeps running in the
+# background and is picked up by a later call. Default 8.
+# health_recovery_budget_seconds = 8
+
+[upstream]
+# Re-resolved from PyPI on every launch (small latency, always current).
+# Pin a version instead for reproducibility, e.g. ["uvx", "mcp-atlassian==0.23.1"].
+command         = ["uvx", "mcp-atlassian@latest"]
+env_passthrough = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+workspace_dir   = "."
+
+# One [[sites]] entry per Jira Cloud (or Server/DC) instance. `name` must be
+# lowercase (letters, digits, "_" or "-"); it's how you address a site
+# explicitly, and how the MCP_ATLASSIAN_BETTER_SITE_<NAME>_* env overlay finds it (a
+# name containing "-" can only be reached that way through the TOML file,
+# since environment variable names can't contain a dash).
+
+[[sites]]
+name         = "acme"
+url          = "https://acme.atlassian.net"
+key_prefixes = ["ACME", "ACMEH", "ACMI"]
+# Every project-key prefix across every [[sites]] entry must be globally
+# unique — that's how a bare "ACME-1234" gets routed without a `site` argument.
+
+[[sites]]
+name         = "beta"
+url          = "https://beta.atlassian.net"
+key_prefixes = ["BETA"]
+# Per-site overrides (all optional): username, api_token, api_token_env,
+# personal_token / personal_token_env (Jira Server/Data Center — mutually
+# exclusive with api_token*), read_only, enabled_tools = ["jira_get_issue", ...]
+# (must be a subset of the effective allowlist for toolset_preset).
+read_only    = true
+
+[[sites]]
+name         = "gamma"
+url          = "https://gamma.atlassian.net"
+key_prefixes = ["GAM"]
+# Restricts which projects THIS SITE'S upstream child will search/browse at
+# all (its JIRA_PROJECTS_FILTER env var) -- separate from a tool call's own
+# projects_filter argument, which only affects routing. Entries are project
+# keys, normalized to uppercase; a numeric project id is never a valid entry
+# here (unlike upstream's JQL, which does accept one).
+projects_filter = ["GAM"]
+# enabled_tools = ["jira_get_issue", "jira_search", "jira_add_comment"]
+
+# Example Server/Data Center site (personal access token, no username needed):
+# [[sites]]
+# name = "onprem"
+# url = "https://jira.example.com"
+# key_prefixes = ["ONPREM"]
+# personal_token_env = "ONPREM_JIRA_PAT"
+
+# --- sites.d/ drop-in directory ---------------------------------------------
+#
+# Another tool (e.g. a dashboard) can add sites without editing this file: any
+# *.toml file dropped into `sites.d/` next to this config.toml (override the
+# directory with the MCP_ATLASSIAN_BETTER_SITES_DIR environment variable) is loaded as
+# extra [[sites]] entries. A drop-in file may contain ONLY [[sites]] -- no
+# [defaults]/[upstream], and no literal api_token/personal_token (use the
+# *_env form instead; only this file, which you control directly, is trusted
+# with a literal secret). Multiple drop-in files are loaded in lexical
+# filename order, and a later file overrides an earlier one field by field
+# for the same site name. This config.toml is loaded LAST, so any [[sites]]
+# entry here overrides a same-named drop-in site's fields too.
