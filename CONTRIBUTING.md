@@ -4,7 +4,8 @@
 
 This repo uses [Conventional Commits](https://www.conventionalcommits.org/):
 `type(scope): message`, where `type` is one of `feat`, `fix`, `chore`, `docs`,
-`ci`, `test`, or `refactor`. The scope is optional.
+`ci`, `test`, `refactor`, or `build`. The scope is optional. Dependabot opens its
+PRs as `build(deps): ...`, which is why `build` is in the list.
 
 ## Pull requests
 

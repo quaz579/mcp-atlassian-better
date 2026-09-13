@@ -8,7 +8,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-title-${{ github.ref }}
+  group: pr-title-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -27,3 +27,4 @@ jobs:
             ci
             test
             refactor
+            build
