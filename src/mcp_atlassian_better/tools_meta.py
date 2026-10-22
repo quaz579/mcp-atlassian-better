@@ -146,3 +146,7 @@ WRAPPER_OWNED_TOOLS: frozenset[str] = frozenset(
         "jira_sites",
     }
 )
+
+WRAPPER_WRITE_TOOLS: frozenset[str] = frozenset({"jira_upload_attachments", "jira_delete_comment"})
+
+WRAPPER_LOCAL_DISK_TOOLS: frozenset[str] = frozenset({"jira_download_attachments", "jira_upload_attachments"})

@@ -114,6 +114,7 @@ with the `MCP_ATLASSIAN_BETTER_CONFIG` environment variable or `--config PATH`.
 | `attachment_max_bytes` | `104857600` (100 MiB) | Per-file cap enforced by `jira_download_attachments`, checked against both the reported `Content-Length` and the actual streamed byte count. |
 | `recovery_cooldown_seconds` | `30` | How long a site that's `failed` stays marked that way before the next call that needs it (or `jira_sites`) tries to reconnect it. See [How site recovery works](#how-site-recovery-works). |
 | `health_recovery_budget_seconds` | `8` | Upper bound on how long one `jira_sites` call waits for recovery to settle before returning — a slower recovery keeps running in the background and is picked up by a later call. See [How site recovery works](#how-site-recovery-works). |
+| `force_read_only` | `false` | When `true`, every site is treated as `read_only = true`, whatever its own setting says. Also settable with `MCP_ATLASSIAN_BETTER_FORCE_READ_ONLY`, which wins over the file. See [Hosting over HTTP](#hosting-over-http). |
 
 ### How site recovery works
 
@@ -193,6 +194,11 @@ lowercased before comparing against the (already-lowercase) site name — so
 it supplies at least `_URL` and `_KEY_PREFIXES` — a stray/typo'd variable
 should never silently create a broken site.
 
+Two more variables apply to the whole config rather than one site, and win over
+the TOML file: `MCP_ATLASSIAN_BETTER_FORCE_READ_ONLY` (a boolean; see
+`force_read_only` above) and `MCP_ATLASSIAN_BETTER_UPSTREAM_COMMAND` (replaces
+`[upstream] command`, split like a shell command line).
+
 ## Useful commands
 
 - `mcp-atlassian-better --print-config` — show the effective, merged configuration
@@ -208,6 +214,100 @@ should never silently create a broken site.
   of reusing a cached version.
 - `mcp-atlassian-better` (no flags) — run the actual MCP server over stdio. This is
   what a client (Claude Code, Claude Desktop, `.mcp.json`) launches.
+- `mcp-atlassian-better --transport streamable-http --host 0.0.0.0 --port 8000` —
+  serve over HTTP instead. See [Hosting over HTTP](#hosting-over-http).
+
+## Hosting over HTTP
+
+Local use doesn't change: with no flags, the server speaks stdio. To host it as
+a shared server (for example in Kubernetes), use the streamable-http transport:
+
+| Flag | Env | Default | Notes |
+|---|---|---|---|
+| `--transport` | `MCP_ATLASSIAN_BETTER_TRANSPORT` | `stdio` | `stdio` or `streamable-http`. |
+| `--host` | `MCP_ATLASSIAN_BETTER_HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` in a container. |
+| `--port` | `MCP_ATLASSIAN_BETTER_PORT` | `8000` | |
+| `--allowed-hosts` | `MCP_ATLASSIAN_BETTER_ALLOWED_HOSTS` | none | Comma-separated `Host` header values accepted on `/mcp`, on top of `localhost` and `127.0.0.1`. Patterns such as `mcp.svc.cluster.local:*` work. Any other `Host` gets `421`. |
+
+Over HTTP:
+
+- The MCP endpoint is `/mcp`.
+- `GET /healthz` returns `200` while the process serves HTTP (liveness).
+- `GET /readyz` returns `200` while at least one site is healthy, and `503`
+  otherwise (readiness).
+- Both health paths skip the `Host` check, so kubelet probes that send the pod
+  IP as `Host` still work.
+- The listener opens only after every child has started (up to
+  `connect_timeout_seconds`), so give the pod a startup probe.
+- `jira_download_attachments` and `jira_upload_attachments` are not offered.
+  Their paths would be on the server's disk, not the caller's.
+  `jira_list_attachments` stays.
+- There is no caller authentication. Put the server behind something that
+  authenticates callers, such as a gateway or a NetworkPolicy.
+
+### Read-only hosting
+
+Set `MCP_ATLASSIAN_BETTER_FORCE_READ_ONLY=true` (or `force_read_only = true`
+in `[defaults]`). Every site then becomes read-only, even one whose TOML,
+drop-in, or `MCP_ATLASSIAN_BETTER_SITE_<NAME>_READ_ONLY` says `false`. When
+every site is read-only:
+
+- Each child runs with upstream's `READ_ONLY_MODE=true`, and upstream leaves
+  its write tools out of the child's tool list.
+- The wrapper also skips any mirrored tool tagged `write` or not annotated
+  `readOnlyHint=True`, as a second guard.
+- `jira_upload_attachments` and `jira_delete_comment` are not registered, so
+  `tools/list` shows no write tool at all.
+
+### Container image
+
+The `Dockerfile` builds an image that:
+
+- Bakes upstream `mcp-atlassian` into `/opt/upstream`, from the hashed lock in
+  `docker/upstream-requirements.txt` (pinned in `docker/upstream.in`). To
+  bump it, edit `docker/upstream.in` and re-run the `uv pip compile` command
+  shown at the top of the lock.
+- Keeps that install in its own venv, apart from the wrapper's, because
+  upstream pins a different `fastmcp` major version.
+- Points the child at `/opt/upstream/bin/mcp-atlassian` with
+  `MCP_ATLASSIAN_BETTER_UPSTREAM_COMMAND`. `uv` and `uvx` are not in the
+  image, so a stray `["uvx", ...]` command in the TOML fails loudly instead
+  of fetching from PyPI.
+- Runs as uid/gid `1000` and works with a read-only root filesystem, given a
+  writable `/tmp` (child logs go to `XDG_STATE_HOME=/tmp/state`).
+- Defaults to streamable-http on `0.0.0.0:8000` with
+  `MCP_ATLASSIAN_BETTER_FORCE_READ_ONLY=true`.
+- Reads `/etc/mcp-atlassian-better/config.toml`, which is meant to be a
+  mounted ConfigMap. Tokens come from env via `api_token_env`, so the file
+  holds no secret.
+
+Example ConfigMap TOML for one Jira Cloud site reached through the scoped API
+gateway base (`https://api.atlassian.com/ex/jira/<cloudId>`). Find the
+cloudId at `https://<site>.atlassian.net/_edge/tenant_info`:
+
+```toml
+[defaults]
+username      = "service-account@example.com"
+api_token_env = "JIRA_API_TOKEN"
+
+[[sites]]
+name         = "example"
+url          = "https://api.atlassian.com/ex/jira/00000000-0000-0000-0000-000000000000"
+key_prefixes = ["PROJ"]
+read_only    = true
+```
+
+Run it locally:
+
+```bash
+docker build -t mcp-atlassian-better .
+docker run --rm -p 127.0.0.1:8000:8000 --read-only --tmpfs /tmp \
+  -e JIRA_API_TOKEN \
+  -v "$PWD/config.toml:/etc/mcp-atlassian-better/config.toml:ro" \
+  mcp-atlassian-better
+```
+
+CI builds the image on every pull request but doesn't publish it.
 
 ## How site resolution works
 

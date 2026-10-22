@@ -1,0 +1,8 @@
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!docker/upstream-requirements.txt
+**/__pycache__

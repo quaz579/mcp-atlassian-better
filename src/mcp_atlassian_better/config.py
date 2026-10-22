@@ -175,6 +175,7 @@ def _parse_defaults(fields: dict[str, Any]) -> Defaults:
         health_recovery_budget_seconds=_positive_number(
             fields, "health_recovery_budget_seconds", 8.0, "defaults"
         ),
+        force_read_only=_parse_bool(fields, "force_read_only", "defaults"),
     )
 
 
@@ -222,6 +223,13 @@ def _positive_number(fields: dict[str, Any], key: str, default: float, label: st
     return number
 
 
+def _parse_bool(fields: dict[str, Any], key: str, label: str) -> bool:
+    value = fields.get(key, False)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label}.{key} must be true or false, got {value!r}")
+    return value
+
+
 def _split_token_fields(
     fields: dict[str, Any], base: str, *, site_label: str
 ) -> tuple[Secret | None, str | None]:
@@ -243,7 +251,7 @@ def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults, *, source
     key_prefixes = _parse_key_prefixes(name, fields.get("key_prefixes"))
 
     username = fields.get("username", defaults.username)
-    read_only = bool(fields.get("read_only", False))
+    read_only = bool(fields.get("read_only", False)) or defaults.force_read_only
     enabled_tools = _parse_enabled_tools(name, fields.get("enabled_tools"), defaults.toolset_preset)
     projects_filter = _parse_projects_filter(name, fields.get("projects_filter"))
 
