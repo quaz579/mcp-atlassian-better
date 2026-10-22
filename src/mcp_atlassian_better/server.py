@@ -12,7 +12,7 @@ import select
 import signal
 import stat
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 
@@ -92,14 +92,25 @@ class HealthRoutes:
     MCP app, so kubelet probes (which send the pod IP as ``Host``) are not
     rejected by the Host allowlist guarding ``/mcp``. ``/healthz`` is 200
     whenever the process serves HTTP; ``/readyz`` is 200 only while at
-    least one site is healthy, 503 otherwise. Each ``/readyz`` also starts
-    recovery of failed sites past their cooldown (waiting at most
-    ``recovery_wait_seconds``), so a pod that started with every site down
-    becomes ready again on its own."""
+    least one site is healthy and the Jira tools are mirrored, 503 otherwise
+    or once shutdown has begun. Each ``/readyz`` also starts recovery of
+    failed sites past their cooldown and, through ``late_mirror``, mirrors
+    tools a recovered site brings (waiting at most ``recovery_wait_seconds``),
+    so a pod that started with every site down becomes ready on its own."""
 
-    def __init__(self, app: ASGIApp, manager: ChildManager, *, recovery_wait_seconds: float = 0.5) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        manager: ChildManager,
+        *,
+        late_mirror: LateMirror | None = None,
+        is_stopping: Callable[[], bool] = lambda: False,
+        recovery_wait_seconds: float = 0.5,
+    ) -> None:
         self._app = app
         self._manager = manager
+        self._late_mirror = late_mirror
+        self._is_stopping = is_stopping
         self._recovery_wait_seconds = recovery_wait_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -116,12 +127,23 @@ class HealthRoutes:
     async def _response(self, path: str) -> JSONResponse:
         if path == LIVENESS_PATH:
             return JSONResponse({"status": "ok"})
-        with anyio.move_on_after(self._recovery_wait_seconds):
-            await self._manager.recover_failed_sites()
+        stopping = self._is_stopping()
+        if not stopping:
+            with anyio.move_on_after(self._recovery_wait_seconds):
+                await self._manager.recover_failed_sites()
+                if self._late_mirror is not None:
+                    await self._late_mirror.after_recovery(None)
         health = self._manager.health()
         healthy = sum(1 for site in health if site["state"] == "healthy")
-        body = {"status": "ready" if healthy else "not_ready", "healthy_sites": healthy, "sites": len(health)}
-        return JSONResponse(body, status_code=200 if healthy else 503)
+        mirrored = self._late_mirror is None or self._late_mirror.mirrored
+        ready = bool(healthy) and mirrored and not stopping
+        body = {
+            "status": "ready" if ready else "not_ready",
+            "healthy_sites": healthy,
+            "sites": len(health),
+            "tools_mirrored": mirrored,
+        }
+        return JSONResponse(body, status_code=200 if ready else 503)
 
 
 def visible_wrapper_tools(tools: Sequence[Tool], *, all_read_only: bool, http: bool) -> list[Tool]:
@@ -137,7 +159,13 @@ def visible_wrapper_tools(tools: Sequence[Tool], *, all_read_only: bool, http: b
 
 
 async def _run_http(
-    mcp: FastMCP, http: HttpSettings, manager: ChildManager, state: _ShutdownState, *, verbose: bool
+    mcp: FastMCP,
+    http: HttpSettings,
+    manager: ChildManager,
+    late_mirror: LateMirror,
+    state: _ShutdownState,
+    *,
+    verbose: bool,
 ) -> None:
     app = mcp.http_app(
         path=http.path,
@@ -147,7 +175,12 @@ async def _run_http(
     )
     server = uvicorn.Server(
         uvicorn.Config(
-            HealthRoutes(app, manager),
+            HealthRoutes(
+                app,
+                manager,
+                late_mirror=late_mirror,
+                is_stopping=lambda: state.http_server is not None and state.http_server.should_exit,
+            ),
             host=http.host,
             port=http.port,
             lifespan="on",
@@ -162,7 +195,11 @@ async def _run_http(
         await server.serve()
     except SystemExit:
         state.http_failed = True
-        _logger.error("could not serve streamable-http on %s:%s (is the port in use?)", http.host, http.port)
+        _logger.error(
+            "streamable-http server failed to start on %s:%s (for example, the port is in use)",
+            http.host,
+            http.port,
+        )
     finally:
         state.http_stopped.set()
 
@@ -325,7 +362,7 @@ async def serve(config: AppConfig, *, verbose: bool = False, http: HttpSettings 
                         if http is None:
                             await mcp.run_stdio_async(show_banner=False)
                         else:
-                            await _run_http(mcp, http, manager, state, verbose=verbose)
+                            await _run_http(mcp, http, manager, late_mirror, state, verbose=verbose)
                         tg.cancel_scope.cancel()
                 finally:
                     # Guarantees the watcher's background thread notices

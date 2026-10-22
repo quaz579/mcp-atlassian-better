@@ -208,7 +208,7 @@ def test_a_busy_port_exits_2_with_a_clear_error_and_no_orphan(tmp_path: Path) ->
         )
     stderr = proc.stderr.decode()
     assert proc.returncode == 2
-    assert "is the port in use?" in stderr
+    assert "failed to start" in stderr
     assert "ExceptionGroup" not in stderr
     child_pid = int(pid_file.read_text())
     deadline = time.monotonic() + 5

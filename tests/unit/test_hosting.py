@@ -325,7 +325,12 @@ async def test_readyz_is_503_until_a_site_is_healthy() -> None:
     manager: Any = _FakeHealth(["failed", "recovering"])
     response = await _get(HealthRoutes(_inner_app, manager), "/readyz")
     assert response.status_code == 503
-    assert response.json() == {"status": "not_ready", "healthy_sites": 0, "sites": 2}
+    assert response.json() == {
+        "status": "not_ready",
+        "healthy_sites": 0,
+        "sites": 2,
+        "tools_mirrored": True,
+    }
 
 
 async def test_readyz_is_200_with_one_healthy_site() -> None:
@@ -368,3 +373,41 @@ async def test_readyz_waits_only_briefly_for_a_slow_recovery() -> None:
     with anyio.fail_after(5):
         response = await _get(app, "/readyz")
     assert response.status_code == 503
+
+
+class _FakeLateMirror:
+    def __init__(self, *, mirrors_on_recovery: bool) -> None:
+        self.mirrored = False
+        self._mirrors_on_recovery = mirrors_on_recovery
+        self.calls: list[object] = []
+
+    async def after_recovery(self, ctx: object) -> str | None:
+        self.calls.append(ctx)
+        if self._mirrors_on_recovery:
+            self.mirrored = True
+        return None
+
+
+async def test_readyz_is_503_while_a_healthy_site_has_no_mirrored_tools() -> None:
+    manager: Any = _FakeHealth(["healthy"])
+    late: Any = _FakeLateMirror(mirrors_on_recovery=False)
+    response = await _get(HealthRoutes(_inner_app, manager, late_mirror=late), "/readyz")
+    assert response.status_code == 503
+    assert response.json()["tools_mirrored"] is False
+    assert late.calls == [None]
+
+
+async def test_readyz_mirrors_late_tools_and_then_reports_ready() -> None:
+    manager: Any = _FakeHealth(["failed"], recovers_to=["healthy"])
+    late: Any = _FakeLateMirror(mirrors_on_recovery=True)
+    response = await _get(HealthRoutes(_inner_app, manager, late_mirror=late), "/readyz")
+    assert response.status_code == 200
+    assert response.json()["tools_mirrored"] is True
+
+
+async def test_readyz_is_503_and_skips_recovery_once_shutdown_began() -> None:
+    manager: Any = _FakeHealth(["healthy"])
+    app = HealthRoutes(_inner_app, manager, is_stopping=lambda: True)
+    response = await _get(app, "/readyz")
+    assert response.status_code == 503
+    assert manager.recover_calls == 0

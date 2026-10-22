@@ -329,7 +329,11 @@ class LateMirror:
         # it wouldn't (see above).
         self._lock = anyio.Lock()
 
-    async def after_recovery(self, ctx: Context) -> str | None:
+    @property
+    def mirrored(self) -> bool:
+        return self._mirrored
+
+    async def after_recovery(self, ctx: Context | None) -> str | None:
         """Returns a note for ``jira_sites`` to surface only when tools WERE
         newly mirrored just now but the connected client couldn't be told
         its tool list changed (it may need a manual re-list); ``None`` in
@@ -386,6 +390,8 @@ class LateMirror:
             self._mirrored = True
         finally:
             self._lock.release()
+        if ctx is None:
+            return None
         try:
             await ctx.session.send_tool_list_changed()
         except Exception:  # noqa: BLE001 - best-effort; an older/simpler client may not support this
