@@ -11,12 +11,13 @@ import anyio
 import httpx
 import mcp_types
 import pytest
+from fastmcp import FastMCP
 from fastmcp.tools import Tool
 
 from mcp_atlassian_better.cli import _http_settings, build_parser, main
 from mcp_atlassian_better.config import load_config
 from mcp_atlassian_better.errors import ConfigError
-from mcp_atlassian_better.mirror import build_mirrored_tools
+from mcp_atlassian_better.mirror import LateMirror, build_mirrored_tools
 from mcp_atlassian_better.model import AppConfig
 from mcp_atlassian_better.registry import SiteRegistry
 from mcp_atlassian_better.server import HealthRoutes, HttpSettings, visible_wrapper_tools
@@ -411,3 +412,33 @@ async def test_readyz_is_503_and_skips_recovery_once_shutdown_began() -> None:
     response = await _get(app, "/readyz")
     assert response.status_code == 503
     assert manager.recover_calls == 0
+
+
+class _StaticDiscoveryManager:
+    def __init__(self, tools: list[mcp_types.Tool]) -> None:
+        self._tools = tools
+        self.calls = 0
+
+    async def discover_tools(self) -> list[mcp_types.Tool]:
+        self.calls += 1
+        return self._tools
+
+
+async def test_late_mirror_counts_as_done_when_filters_drop_every_discovered_tool(tmp_path: Path) -> None:
+    config = _load(tmp_path, {})
+    manager: Any = _StaticDiscoveryManager(
+        [_mcp_tool("jira_create_issue", read_only_hint=None, tags=["write"])]
+    )
+    late = LateMirror(FastMCP("t"), manager, SiteRegistry(config.sites), None, 5.0, read_only_only=True)
+    assert await late.after_recovery(None) is None
+    assert late.mirrored is True
+    await late.after_recovery(None)
+    assert manager.calls == 1
+
+
+async def test_late_mirror_retries_when_discovery_finds_nothing(tmp_path: Path) -> None:
+    config = _load(tmp_path, {})
+    manager: Any = _StaticDiscoveryManager([])
+    late = LateMirror(FastMCP("t"), manager, SiteRegistry(config.sites), None, 5.0)
+    await late.after_recovery(None)
+    assert late.mirrored is False

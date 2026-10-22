@@ -373,6 +373,10 @@ class LateMirror:
                     self._timeout,
                 )
                 return None
+            if not tools:
+                # Nothing healthy enough yet to mirror anything real --
+                # leave `_mirrored` false so a later call can retry.
+                return None
             mirrored = build_mirrored_tools(
                 tools,
                 self._manager,
@@ -382,8 +386,7 @@ class LateMirror:
                 read_only_only=self._read_only_only,
             )
             if not mirrored:
-                # Nothing healthy enough yet to mirror anything real --
-                # leave `_mirrored` false so a later call can retry.
+                self._mirrored = True
                 return None
             for tool in mirrored:
                 self._mcp.add_tool(tool)
