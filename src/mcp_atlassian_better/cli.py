@@ -22,13 +22,24 @@ from mcp_atlassian_better.errors import McpAtlassianBetterError
 from mcp_atlassian_better.logging_setup import LOGGER_NAME, collect_secrets, configure_logging
 from mcp_atlassian_better.model import AppConfig, SiteConfig
 from mcp_atlassian_better.secrets import redact_text
-from mcp_atlassian_better.server import SHUTDOWN_WATCHDOG_SECONDS, serve
+from mcp_atlassian_better.server import (
+    DEFAULT_HTTP_HOST,
+    DEFAULT_HTTP_PORT,
+    SHUTDOWN_WATCHDOG_SECONDS,
+    HttpSettings,
+    serve,
+)
 from mcp_atlassian_better.sources import ConfigSource, EnvOverlaySource
 
 _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
 _SERVER_MYSELF_PATH = "/rest/api/2/myself"
 _UVX_TOKENS = ("uvx",)
 _UV_TOOL_RUN_TOKENS = ("uv", "tool", "run")
+_TRANSPORTS = ("stdio", "streamable-http")
+_TRANSPORT_ENV = "MCP_ATLASSIAN_BETTER_TRANSPORT"
+_HOST_ENV = "MCP_ATLASSIAN_BETTER_HOST"
+_PORT_ENV = "MCP_ATLASSIAN_BETTER_PORT"
+_ALLOWED_HOSTS_ENV = "MCP_ATLASSIAN_BETTER_ALLOWED_HOSTS"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,7 +77,59 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --check, exit 0 if at least one site authenticates, even if others fail.",
     )
+    parser.add_argument(
+        "--transport",
+        choices=_TRANSPORTS,
+        default=None,
+        help=f"MCP transport (env {_TRANSPORT_ENV}; default stdio).",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=f"streamable-http bind address (env {_HOST_ENV}; default {DEFAULT_HTTP_HOST}).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"streamable-http port (env {_PORT_ENV}; default {DEFAULT_HTTP_PORT}).",
+    )
+    parser.add_argument(
+        "--allowed-hosts",
+        default=None,
+        dest="allowed_hosts",
+        help=(
+            "Comma-separated Host header values accepted on the MCP endpoint, in addition to "
+            f"localhost and 127.0.0.1; fnmatch patterns allowed (env {_ALLOWED_HOSTS_ENV})."
+        ),
+    )
     return parser
+
+
+def _http_settings(parser: argparse.ArgumentParser, args: argparse.Namespace) -> HttpSettings | None:
+    transport = args.transport or os.environ.get(_TRANSPORT_ENV, "").strip() or "stdio"
+    if transport not in _TRANSPORTS:
+        parser.error(f"{_TRANSPORT_ENV} must be one of {', '.join(_TRANSPORTS)}, got {transport!r}")
+    if transport == "stdio":
+        return None
+    host = args.host or os.environ.get(_HOST_ENV, "").strip() or DEFAULT_HTTP_HOST
+    port = args.port
+    if port is None:
+        raw_port = os.environ.get(_PORT_ENV, "").strip()
+        if raw_port:
+            try:
+                port = int(raw_port)
+            except ValueError:
+                parser.error(f"{_PORT_ENV} must be an integer, got {raw_port!r}")
+        else:
+            port = DEFAULT_HTTP_PORT
+    if not 1 <= port <= 65535:
+        parser.error(f"port must be between 1 and 65535, got {port}")
+    raw_hosts = args.allowed_hosts
+    if raw_hosts is None:
+        raw_hosts = os.environ.get(_ALLOWED_HOSTS_ENV, "")
+    allowed_hosts = tuple(item.strip() for item in raw_hosts.split(",") if item.strip())
+    return HttpSettings(host=host, port=port, allowed_hosts=allowed_hosts)
 
 
 def _sources_for(config_path: Path | None) -> list[ConfigSource] | None:
@@ -84,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("only one of --check, --print-config, --warm may be given")
     if args.refresh and not args.warm:
         parser.error("--refresh requires --warm")
+    http = _http_settings(parser, args)
 
     # Configured before load_config so an advisory message logged while parsing
     # (e.g. "consider api_token_env") actually reaches a handler; reconfigured
@@ -111,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_cmd_check(config, allow_partial=args.allow_partial))
 
     try:
-        return _serve_with_watchdog(config, verbose=args.verbose)
+        return _serve_with_watchdog(config, verbose=args.verbose, http=http)
     except McpAtlassianBetterError as exc:
         # e.g. SchemaConflictError raised while building the mirrored tool
         # set: a deliberate error, not a bug, so it gets the same clean
@@ -121,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
 
-def _serve_with_watchdog(config: AppConfig, *, verbose: bool) -> int:
+def _serve_with_watchdog(config: AppConfig, *, verbose: bool, http: HttpSettings | None = None) -> int:
     """Runs ``serve()`` under ``asyncio.run``, with a ``threading.Timer``
     watchdog that outlives ``serve()`` itself.
 
@@ -154,7 +218,7 @@ def _serve_with_watchdog(config: AppConfig, *, verbose: bool) -> int:
 
     async def _serve_then_arm() -> int:
         try:
-            rc = await serve(config, verbose=verbose)
+            rc = await serve(config, verbose=verbose, http=http)
         except BaseException:
             # A startup failure (e.g. `McpAtlassianBetterError`) still means every
             # coroutine inside `serve()` has already unwound -- the only
@@ -205,6 +269,7 @@ def _render_config(config: AppConfig) -> str:
         f"  attachment_max_bytes = {config.defaults.attachment_max_bytes}",
         f"  recovery_cooldown_seconds = {config.defaults.recovery_cooldown_seconds}",
         f"  health_recovery_budget_seconds = {config.defaults.health_recovery_budget_seconds}",
+        f"  force_read_only = {config.defaults.force_read_only}",
         "",
         "[upstream]",
         f"  command = {list(config.upstream.command)!r}",

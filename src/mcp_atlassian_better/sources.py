@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import stat
 import sys
 from collections.abc import Mapping
@@ -215,6 +216,8 @@ class EnvOverlaySource:
     """
 
     PREFIX = "MCP_ATLASSIAN_BETTER_SITE_"
+    FORCE_READ_ONLY = "MCP_ATLASSIAN_BETTER_FORCE_READ_ONLY"
+    UPSTREAM_COMMAND = "MCP_ATLASSIAN_BETTER_UPSTREAM_COMMAND"
 
     def __init__(self, environ: Mapping[str, str] | None = None) -> None:
         self.name = "env"
@@ -234,10 +237,21 @@ class EnvOverlaySource:
                     break
                 sites.setdefault(site_name, {})[field] = _parse_env_value(value, kind, key)
                 break
+        defaults: dict[str, Any] = {}
+        force_read_only = self._environ.get(self.FORCE_READ_ONLY)
+        if force_read_only is not None and force_read_only.strip():
+            defaults["force_read_only"] = _parse_env_value(force_read_only, "bool", self.FORCE_READ_ONLY)
+        upstream: dict[str, Any] = {}
+        upstream_command = self._environ.get(self.UPSTREAM_COMMAND)
+        if upstream_command is not None and upstream_command.strip():
+            try:
+                upstream["command"] = shlex.split(upstream_command)
+            except ValueError as exc:
+                raise ConfigError(f"environment variable {self.UPSTREAM_COMMAND}: {exc}") from exc
         # No provenance: an env overlay only ever patches fields onto a site
         # another source already introduced, so it must never claim ownership
         # of that site in merge_sources' "sources" map.
-        return {"defaults": {}, "upstream": {}, "sites": sites, "sources": {}}
+        return {"defaults": defaults, "upstream": upstream, "sites": sites, "sources": {}}
 
 
 def _parse_env_value(value: str, kind: str, var_name: str) -> Any:

@@ -36,3 +36,13 @@ jobs:
           python-version: "3.13"
       - run: uv build
       - run: uvx --from . mcp-atlassian-better --help
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t mcp-atlassian-better:ci .
+      - run: docker run --rm mcp-atlassian-better:ci --version
+      - run: docker run --rm --entrypoint /opt/upstream/bin/mcp-atlassian mcp-atlassian-better:ci --version
+      - run: test "$(docker run --rm --entrypoint id mcp-atlassian-better:ci -u)" = "1000"
+      - run: "! docker run --rm --entrypoint sh mcp-atlassian-better:ci -c 'command -v uv || command -v uvx'"

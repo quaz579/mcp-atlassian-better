@@ -244,10 +244,15 @@ def build_mirrored_tools(
     registry: SiteRegistry,
     allowlist: frozenset[str] | None,
     timeout: float,
+    *,
+    read_only_only: bool = False,
 ) -> list[MultiSiteProxyTool]:
     """One ``MultiSiteProxyTool`` per discovered tool that isn't wrapper-owned
     and (when ``allowlist`` is given) is in it. ``allowlist=None`` mirrors
-    every discovered tool (the "all" toolset preset)."""
+    every discovered tool (the "all" toolset preset). ``read_only_only=True``
+    (every site is read-only) also drops any tool tagged ``write`` or not
+    explicitly annotated ``readOnlyHint=True``, as a belt over the children's
+    own ``READ_ONLY_MODE``."""
     mirrored = []
     discovered_names = {tool.name for tool in mcp_tools}
     for mcp_tool in mcp_tools:
@@ -255,13 +260,23 @@ def build_mirrored_tools(
             continue
         if allowlist is not None and mcp_tool.name not in allowlist:
             continue
-        mirrored.append(MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout))
+        tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout)
+        if read_only_only and not _is_read_only_tool(tool):
+            _logger.info("every site is read_only; not mirroring '%s'", tool.name)
+            continue
+        mirrored.append(tool)
 
     if allowlist is not None:
         for name in sorted((allowlist - WRAPPER_OWNED_TOOLS) - discovered_names):
             _logger.warning("tool '%s' is allowlisted but no healthy child advertised it", name)
 
     return mirrored
+
+
+def _is_read_only_tool(tool: MultiSiteProxyTool) -> bool:
+    if "write" in tool.tags:
+        return False
+    return tool.annotations is not None and tool.annotations.read_only_hint is True
 
 
 class LateMirror:
@@ -290,8 +305,10 @@ class LateMirror:
         timeout: float,
         *,
         already_mirrored: bool = False,
+        read_only_only: bool = False,
     ) -> None:
         self._mcp = mcp
+        self._read_only_only = read_only_only
         self._manager = manager
         self._registry = registry
         self._allowlist = allowlist
@@ -312,7 +329,11 @@ class LateMirror:
         # it wouldn't (see above).
         self._lock = anyio.Lock()
 
-    async def after_recovery(self, ctx: Context) -> str | None:
+    @property
+    def mirrored(self) -> bool:
+        return self._mirrored
+
+    async def after_recovery(self, ctx: Context | None) -> str | None:
         """Returns a note for ``jira_sites`` to surface only when tools WERE
         newly mirrored just now but the connected client couldn't be told
         its tool list changed (it may need a manual re-list); ``None`` in
@@ -352,18 +373,28 @@ class LateMirror:
                     self._timeout,
                 )
                 return None
-            mirrored = build_mirrored_tools(
-                tools, self._manager, self._registry, self._allowlist, self._timeout
-            )
-            if not mirrored:
+            if not tools:
                 # Nothing healthy enough yet to mirror anything real --
                 # leave `_mirrored` false so a later call can retry.
+                return None
+            mirrored = build_mirrored_tools(
+                tools,
+                self._manager,
+                self._registry,
+                self._allowlist,
+                self._timeout,
+                read_only_only=self._read_only_only,
+            )
+            if not mirrored:
+                self._mirrored = True
                 return None
             for tool in mirrored:
                 self._mcp.add_tool(tool)
             self._mirrored = True
         finally:
             self._lock.release()
+        if ctx is None:
+            return None
         try:
             await ctx.session.send_tool_list_changed()
         except Exception:  # noqa: BLE001 - best-effort; an older/simpler client may not support this

@@ -1,7 +1,7 @@
 """Builds and runs the single mirrored MCP server: starts every configured
 child, discovers its tool set, registers the mirrored tools plus
-``jira_sites``, and serves over stdio until the client disconnects or a
-shutdown signal arrives."""
+``jira_sites``, and serves over stdio (or streamable-http) until the client
+disconnects or a shutdown signal arrives."""
 
 from __future__ import annotations
 
@@ -12,13 +12,17 @@ import select
 import signal
 import stat
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import anyio
 import anyio.to_thread
+import uvicorn
 from fastmcp import FastMCP
+from fastmcp.tools import Tool
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp_atlassian_better import __version__
 from mcp_atlassian_better.attachments import AttachmentClientRegistry
@@ -28,7 +32,7 @@ from mcp_atlassian_better.logging_setup import attach_redaction, configure_loggi
 from mcp_atlassian_better.mirror import LateMirror, build_mirrored_tools
 from mcp_atlassian_better.model import AppConfig
 from mcp_atlassian_better.registry import SiteRegistry
-from mcp_atlassian_better.tools_meta import CURATED_TOOLS
+from mcp_atlassian_better.tools_meta import CURATED_TOOLS, WRAPPER_LOCAL_DISK_TOOLS, WRAPPER_WRITE_TOOLS
 from mcp_atlassian_better.wrapper_tools import (
     build_attachment_tools,
     build_comment_tools,
@@ -52,6 +56,8 @@ SHUTDOWN_WATCHDOG_SECONDS = 5.0
 # instead of silently racing the watchdog to the same `os._exit` call.
 _ACLOSE_BUDGET_SECONDS = SHUTDOWN_WATCHDOG_SECONDS - 1
 
+_HTTP_DRAIN_SECONDS = 1.5
+
 
 @dataclass
 class _ShutdownState:
@@ -60,9 +66,145 @@ class _ShutdownState:
     cleanly, instead of always claiming success."""
 
     aclose_completed: bool = False
+    http_server: uvicorn.Server | None = None
+    http_failed: bool = False
+    http_stopped: anyio.Event = field(default_factory=anyio.Event)
 
 
-async def serve(config: AppConfig, *, verbose: bool = False) -> int:
+LIVENESS_PATH = "/healthz"
+READINESS_PATH = "/readyz"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+
+
+@dataclass(frozen=True, slots=True)
+class HttpSettings:
+    """Where and how to serve the streamable-http transport instead of stdio."""
+
+    host: str = DEFAULT_HTTP_HOST
+    port: int = DEFAULT_HTTP_PORT
+    path: str = "/mcp"
+    allowed_hosts: tuple[str, ...] = ()
+
+
+class HealthRoutes:
+    """Answers ``GET``/``HEAD`` on ``/healthz`` and ``/readyz`` ahead of the
+    MCP app, so kubelet probes (which send the pod IP as ``Host``) are not
+    rejected by the Host allowlist guarding ``/mcp``. ``/healthz`` is 200
+    whenever the process serves HTTP; ``/readyz`` is 200 only while at
+    least one site is healthy and the Jira tools are mirrored, 503 otherwise
+    or once shutdown has begun. Each ``/readyz`` also starts recovery of
+    failed sites past their cooldown and, through ``late_mirror``, mirrors
+    tools a recovered site brings (waiting at most ``recovery_wait_seconds``),
+    so a pod that started with every site down becomes ready on its own."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        manager: ChildManager,
+        *,
+        late_mirror: LateMirror | None = None,
+        is_stopping: Callable[[], bool] = lambda: False,
+        recovery_wait_seconds: float = 0.5,
+    ) -> None:
+        self._app = app
+        self._manager = manager
+        self._late_mirror = late_mirror
+        self._is_stopping = is_stopping
+        self._recovery_wait_seconds = recovery_wait_seconds
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope["path"] in (LIVENESS_PATH, READINESS_PATH)
+            and scope["method"] in ("GET", "HEAD")
+        ):
+            response = await self._response(scope["path"])
+            await response(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+    async def _response(self, path: str) -> JSONResponse:
+        if path == LIVENESS_PATH:
+            return JSONResponse({"status": "ok"})
+        stopping = self._is_stopping()
+        if not stopping:
+            with anyio.move_on_after(self._recovery_wait_seconds):
+                await self._manager.recover_failed_sites()
+                if self._late_mirror is not None:
+                    await self._late_mirror.after_recovery(None)
+        health = self._manager.health()
+        healthy = sum(1 for site in health if site["state"] == "healthy")
+        mirrored = self._late_mirror is None or self._late_mirror.mirrored
+        ready = bool(healthy) and mirrored and not stopping
+        body = {
+            "status": "ready" if ready else "not_ready",
+            "healthy_sites": healthy,
+            "sites": len(health),
+            "tools_mirrored": mirrored,
+        }
+        return JSONResponse(body, status_code=200 if ready else 503)
+
+
+def visible_wrapper_tools(tools: Sequence[Tool], *, all_read_only: bool, http: bool) -> list[Tool]:
+    """Drops the wrapper's own Jira-write tools when every site is read-only,
+    and its local-disk tools when serving over HTTP (their paths would be on
+    the server's disk, not the caller's)."""
+    hidden: set[str] = set()
+    if all_read_only:
+        hidden |= WRAPPER_WRITE_TOOLS
+    if http:
+        hidden |= WRAPPER_LOCAL_DISK_TOOLS
+    return [tool for tool in tools if tool.name not in hidden]
+
+
+async def _run_http(
+    mcp: FastMCP,
+    http: HttpSettings,
+    manager: ChildManager,
+    late_mirror: LateMirror,
+    state: _ShutdownState,
+    *,
+    verbose: bool,
+) -> None:
+    app = mcp.http_app(
+        path=http.path,
+        transport="streamable-http",
+        host_origin_protection=True,
+        allowed_hosts=list(http.allowed_hosts),
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            HealthRoutes(
+                app,
+                manager,
+                late_mirror=late_mirror,
+                is_stopping=lambda: state.http_server is not None and state.http_server.should_exit,
+            ),
+            host=http.host,
+            port=http.port,
+            lifespan="on",
+            timeout_graceful_shutdown=1,
+            log_config=None,
+            log_level="info" if verbose else "warning",
+        )
+    )
+    _logger.info("serving streamable-http on %s:%s%s", http.host, http.port, http.path)
+    state.http_server = server
+    try:
+        await server.serve()
+    except SystemExit:
+        state.http_failed = True
+        _logger.error(
+            "streamable-http server failed to start on %s:%s (for example, the port is in use)",
+            http.host,
+            http.port,
+        )
+    finally:
+        state.http_stopped.set()
+
+
+async def serve(config: AppConfig, *, verbose: bool = False, http: HttpSettings | None = None) -> int:
     configure_logging(config, verbose=verbose)
     # Defense in depth: fastmcp's own import-time logging setup attaches a
     # non-propagating RichHandler directly to the "fastmcp" logger. By this
@@ -78,6 +220,7 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
     attachment_clients = AttachmentClientRegistry(config.sites, config.defaults, redact=manager.redact)
 
     mcp: FastMCP = FastMCP(_SERVER_NAME, version=__version__)
+    all_read_only = all(site.read_only for site in config.sites)
     state = _ShutdownState()
     startup_error: McpAtlassianBetterError | None = None
 
@@ -125,7 +268,8 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                 # (success or failure) so `run_stdio_async` becomes the sole
                 # reader of fd 0 from then on, exactly as before this change.
                 stop_watching_stdin = threading.Event()
-                await tg.start(_watch_stdin_for_eof, tg.cancel_scope, manager, state, stop_watching_stdin)
+                if http is None:
+                    await tg.start(_watch_stdin_for_eof, tg.cancel_scope, manager, state, stop_watching_stdin)
 
                 try:
                     try:
@@ -139,7 +283,12 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
 
                         allowlist = CURATED_TOOLS if config.defaults.toolset_preset == "curated" else None
                         mirrored = build_mirrored_tools(
-                            tools, manager, registry, allowlist, config.defaults.call_timeout_seconds
+                            tools,
+                            manager,
+                            registry,
+                            allowlist,
+                            config.defaults.call_timeout_seconds,
+                            read_only_only=all_read_only,
                         )
                     except McpAtlassianBetterError as exc:
                         # Caught here rather than left to escape the task group:
@@ -189,12 +338,18 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                             # -- it would otherwise re-discover (and re-warn)
                             # on every single `jira_sites` call for no reason.
                             already_mirrored=bool(tools),
+                            read_only_only=all_read_only,
                         )
                         mcp.add_tool(build_jira_sites_tool(manager, config.defaults, late_mirror=late_mirror))
-                        for attachment_tool in build_attachment_tools(registry, attachment_clients):
-                            mcp.add_tool(attachment_tool)
-                        for comment_tool in build_comment_tools(registry, attachment_clients):
-                            mcp.add_tool(comment_tool)
+                        for wrapper_tool in visible_wrapper_tools(
+                            [
+                                *build_attachment_tools(registry, attachment_clients),
+                                *build_comment_tools(registry, attachment_clients),
+                            ],
+                            all_read_only=all_read_only,
+                            http=http is not None,
+                        ):
+                            mcp.add_tool(wrapper_tool)
                         for tool in mirrored:
                             mcp.add_tool(tool)
 
@@ -204,7 +359,10 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                         # `run_stdio_async` takes over as fd 0's sole reader
                         # (see the watcher's own module-level comment above).
                         stop_watching_stdin.set()
-                        await mcp.run_stdio_async(show_banner=False)
+                        if http is None:
+                            await mcp.run_stdio_async(show_banner=False)
+                        else:
+                            await _run_http(mcp, http, manager, late_mirror, state, verbose=verbose)
                         tg.cancel_scope.cancel()
                 finally:
                     # Guarantees the watcher's background thread notices
@@ -259,6 +417,8 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
     if startup_error is not None:
         raise startup_error
 
+    if state.http_failed:
+        return 2
     return 0 if state.aclose_completed else 1
 
 
@@ -277,6 +437,10 @@ async def _shutdown_children(
     guarantees the process still exits.
     """
     asyncio.get_running_loop().call_later(SHUTDOWN_WATCHDOG_SECONDS, _force_exit, state)
+    if state.http_server is not None:
+        state.http_server.should_exit = True
+        with anyio.move_on_after(_HTTP_DRAIN_SECONDS):
+            await state.http_stopped.wait()
     # Cancel FIRST, close second: a child whose connect is still in flight
     # (this trigger landing during the startup window) is a task blocked
     # inside fastmcp's `Client._connect()`, which holds that Client's own
