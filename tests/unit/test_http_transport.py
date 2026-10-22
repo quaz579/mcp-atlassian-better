@@ -172,3 +172,46 @@ def test_streamable_http_serves_a_forced_read_only_tool_list(tmp_path: Path) -> 
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_a_busy_port_exits_2_with_a_clear_error_and_no_orphan(tmp_path: Path) -> None:
+    pid_file = tmp_path / "child.pid"
+    upstream = _write_upstream_script(tmp_path)
+    config_path = _write_config(tmp_path)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        port = int(busy.getsockname()[1])
+        env = {
+            **os.environ,
+            "FAKE_JIRA_TOKEN": "fake-token-value",
+            "MCP_ATLASSIAN_BETTER_UPSTREAM_COMMAND": f"{sys.executable} {upstream} {pid_file}",
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+        }
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mcp_atlassian_better",
+                "--config",
+                str(config_path),
+                "--transport",
+                "streamable-http",
+                "--port",
+                str(port),
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+        )
+    stderr = proc.stderr.decode()
+    assert proc.returncode == 2
+    assert "is the port in use?" in stderr
+    assert "ExceptionGroup" not in stderr
+    child_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _pid_alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _pid_alive(child_pid)

@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import mcp_types
 import pytest
@@ -288,11 +289,25 @@ def test_read_only_only_mirror_drops_writes_and_unannotated_tools(tmp_path: Path
 
 
 class _FakeHealth:
-    def __init__(self, states: list[str]) -> None:
+    def __init__(self, states: list[str], *, recovers_to: list[str] | None = None) -> None:
         self._states = states
+        self._recovers_to = recovers_to
+        self.recover_calls = 0
+
+    async def recover_failed_sites(self) -> list[str]:
+        self.recover_calls += 1
+        if self._recovers_to is not None:
+            self._states = self._recovers_to
+        return []
 
     def health(self) -> list[dict[str, object]]:
         return [{"name": f"s{i}", "state": state} for i, state in enumerate(self._states)]
+
+
+class _HangingRecovery(_FakeHealth):
+    async def recover_failed_sites(self) -> list[str]:
+        await anyio.sleep_forever()
+        return []
 
 
 async def _inner_app(scope: Any, receive: Any, send: Any) -> None:
@@ -331,3 +346,25 @@ async def test_other_paths_and_methods_reach_the_mcp_app() -> None:
     app = HealthRoutes(_inner_app, manager)
     assert (await _get(app, "/mcp")).status_code == 418
     assert (await _get(app, "/healthz", method="POST")).status_code == 418
+
+
+async def test_readyz_drives_recovery_so_a_pod_that_started_unready_recovers() -> None:
+    manager: Any = _FakeHealth(["failed"], recovers_to=["healthy"])
+    app = HealthRoutes(_inner_app, manager)
+    response = await _get(app, "/readyz")
+    assert manager.recover_calls == 1
+    assert response.status_code == 200
+
+
+async def test_healthz_does_not_drive_recovery() -> None:
+    manager: Any = _FakeHealth(["failed"], recovers_to=["healthy"])
+    await _get(HealthRoutes(_inner_app, manager), "/healthz")
+    assert manager.recover_calls == 0
+
+
+async def test_readyz_waits_only_briefly_for_a_slow_recovery() -> None:
+    manager: Any = _HangingRecovery(["failed"])
+    app = HealthRoutes(_inner_app, manager, recovery_wait_seconds=0.05)
+    with anyio.fail_after(5):
+        response = await _get(app, "/readyz")
+    assert response.status_code == 503

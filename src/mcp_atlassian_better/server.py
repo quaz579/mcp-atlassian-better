@@ -67,6 +67,7 @@ class _ShutdownState:
 
     aclose_completed: bool = False
     http_server: uvicorn.Server | None = None
+    http_failed: bool = False
     http_stopped: anyio.Event = field(default_factory=anyio.Event)
 
 
@@ -91,11 +92,15 @@ class HealthRoutes:
     MCP app, so kubelet probes (which send the pod IP as ``Host``) are not
     rejected by the Host allowlist guarding ``/mcp``. ``/healthz`` is 200
     whenever the process serves HTTP; ``/readyz`` is 200 only while at
-    least one site is healthy, 503 otherwise."""
+    least one site is healthy, 503 otherwise. Each ``/readyz`` also starts
+    recovery of failed sites past their cooldown (waiting at most
+    ``recovery_wait_seconds``), so a pod that started with every site down
+    becomes ready again on its own."""
 
-    def __init__(self, app: ASGIApp, manager: ChildManager) -> None:
+    def __init__(self, app: ASGIApp, manager: ChildManager, *, recovery_wait_seconds: float = 0.5) -> None:
         self._app = app
         self._manager = manager
+        self._recovery_wait_seconds = recovery_wait_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
@@ -103,13 +108,16 @@ class HealthRoutes:
             and scope["path"] in (LIVENESS_PATH, READINESS_PATH)
             and scope["method"] in ("GET", "HEAD")
         ):
-            await self._response(scope["path"])(scope, receive, send)
+            response = await self._response(scope["path"])
+            await response(scope, receive, send)
             return
         await self._app(scope, receive, send)
 
-    def _response(self, path: str) -> JSONResponse:
+    async def _response(self, path: str) -> JSONResponse:
         if path == LIVENESS_PATH:
             return JSONResponse({"status": "ok"})
+        with anyio.move_on_after(self._recovery_wait_seconds):
+            await self._manager.recover_failed_sites()
         health = self._manager.health()
         healthy = sum(1 for site in health if site["state"] == "healthy")
         body = {"status": "ready" if healthy else "not_ready", "healthy_sites": healthy, "sites": len(health)}
@@ -152,6 +160,9 @@ async def _run_http(
     state.http_server = server
     try:
         await server.serve()
+    except SystemExit:
+        state.http_failed = True
+        _logger.error("could not serve streamable-http on %s:%s (is the port in use?)", http.host, http.port)
     finally:
         state.http_stopped.set()
 
@@ -369,6 +380,8 @@ async def serve(config: AppConfig, *, verbose: bool = False, http: HttpSettings 
     if startup_error is not None:
         raise startup_error
 
+    if state.http_failed:
+        return 2
     return 0 if state.aclose_completed else 1
 
 

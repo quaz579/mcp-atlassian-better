@@ -234,7 +234,8 @@ Over HTTP:
 - The MCP endpoint is `/mcp`.
 - `GET /healthz` returns `200` while the process serves HTTP (liveness).
 - `GET /readyz` returns `200` while at least one site is healthy, and `503`
-  otherwise (readiness).
+  otherwise (readiness). Each call also starts recovery of failed sites,
+  so a pod that started with every site down becomes ready on its own.
 - Both health paths skip the `Host` check, so kubelet probes that send the pod
   IP as `Host` still work.
 - The listener opens only after every child has started (up to
@@ -259,6 +260,8 @@ every site is read-only:
 - `jira_upload_attachments` and `jira_delete_comment` are not registered, so
   `tools/list` shows no write tool at all.
 
+This applies over stdio too, whenever every configured site is read-only.
+
 ### Container image
 
 The `Dockerfile` builds an image that:
@@ -280,6 +283,8 @@ The `Dockerfile` builds an image that:
 - Reads `/etc/mcp-atlassian-better/config.toml`, which is meant to be a
   mounted ConfigMap. Tokens come from env via `api_token_env`, so the file
   holds no secret.
+  Mount it with `defaultMode: 0440` (or `0400`) to avoid the group/other
+  permissions warning.
 
 Example ConfigMap TOML for one Jira Cloud site reached through the scoped API
 gateway base (`https://api.atlassian.com/ex/jira/<cloudId>`). Find the
